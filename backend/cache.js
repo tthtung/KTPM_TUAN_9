@@ -1,27 +1,49 @@
 // =========================================================
-//  cache.js – In-memory cache mô phỏng Redis
-//  TTL mặc định: 30 giây
+//  cache.js – Real Redis via ioredis
 // =========================================================
-const NodeCache = require('node-cache');
+const Redis  = require('ioredis');
+const config = require('./config');
 
-const cache = new NodeCache({ stdTTL: 30, checkperiod: 10 });
+const client = new Redis(config.redis);
+let hits = 0, misses = 0;
 
-let hits = 0;
-let misses = 0;
+client.on('connect', () => console.log('[Redis] ✅ Connected to Redis server'));
+client.on('error',   (e) => console.error('[Redis] ❌ Error:', e.message));
 
-module.exports = {
-  get(key) {
-    const val = cache.get(key);
-    if (val !== undefined) { hits++; return val; }
-    misses++;
-    return null;
-  },
-  set(key, value, ttl) {
-    return ttl ? cache.set(key, value, ttl) : cache.set(key, value);
-  },
-  del(key) { return cache.del(key); },
-  flush() { cache.flushAll(); hits = 0; misses = 0; },
-  stats() {
-    return { keys: cache.keys().length, hits, misses, hitRate: hits + misses ? ((hits / (hits + misses)) * 100).toFixed(1) + '%' : '0%' };
+async function get(key) {
+  const raw = await client.get(key);
+  if (raw !== null) {
+    hits++;
+    return JSON.parse(raw);
   }
-};
+  misses++;
+  return null;
+}
+
+async function set(key, value, ttl = config.cache.ttl) {
+  await client.setex(key, ttl, JSON.stringify(value));
+}
+
+async function del(...keys) {
+  if (keys.length) await client.del(...keys);
+}
+
+async function flush() {
+  await client.flushdb();
+  hits = 0;
+  misses = 0;
+  console.log('[Redis] 🗑  Cache flushed');
+}
+
+async function stats() {
+  const keyCount = await client.dbsize();
+  const total    = hits + misses;
+  return {
+    keys:    keyCount,
+    hits,
+    misses,
+    hitRate: total ? ((hits / total) * 100).toFixed(1) + '%' : '0%',
+  };
+}
+
+module.exports = { get, set, del, flush, stats, client };

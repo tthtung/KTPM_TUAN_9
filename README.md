@@ -1,50 +1,101 @@
-# ⚡ High-Throughput Architecture Demo
+# ⚡ High-Throughput Architecture Demo — v2 (Real Redis + RabbitMQ)
 
-Mô phỏng kiến trúc hệ thống chịu tải cao với **Redis Cache + Message Queue + Worker Pattern**.
+Mô phỏng kiến trúc hệ thống chịu tải cao với **Redis thật + RabbitMQ thật + SQLite**.
 
 ---
 
 ## 🏗️ Kiến trúc hệ thống
 
 ```
-UI/Postman
-    │
-    ▼
- Backend (BE)  ◄──────────────────────┐
-    │   │                             │
-    │   └──► Redis Cache (node-cache) │
-    │                                 │
-    ├──► write-mq ──► write-services ─┤
-    │                       │         │
-    └──► read-mq  ──► read-services   │
-                       │              │
-                       ▼              │
-                   Database ──────────┘
-                  (SQLite)
+UI / Postman
+     │
+     ▼
+ Backend (BE)  ◄─────────────────────────────────┐
+     │   │                                        │
+     │   └──► Redis (ioredis) ── Cache HIT ───────┤
+     │             Cache MISS                     │
+     ├──────────────────────────────────────────  │
+     │                                            │
+     ├──► write-mq (RabbitMQ) ──► write-services  │
+     │                                │           │
+     └──► read-mq  (RabbitMQ) ──► read-services   │
+                                      │    reply  │
+                                      ▼           │
+                                  SQLite DB ──────┘
+                              (lưu vào Redis cache)
 ```
 
 ### Luồng hoạt động
 
-| Loại | Luồng |
-|------|-------|
-| **READ** | BE → kiểm tra Cache → **Cache HIT**: trả ngay / **Cache MISS**: đẩy read-mq → read-services đọc DB → lưu cache → trả về |
-| **WRITE** | BE → đẩy write-mq → trả 202 ngay → write-services ghi DB bất đồng bộ → xóa cache |
+| Loại | Chi tiết |
+|------|----------|
+| **READ** | BE → `cache.get()` Redis → **HIT**: trả ngay / **MISS**: publish `read-mq` → read-worker đọc DB → lưu Redis → RPC reply → BE trả client |
+| **WRITE** | BE → publish `write-mq` → trả **202** ngay → write-worker ghi DB → xóa Redis cache |
 
 ---
 
 ## 🚀 Cài đặt & Khởi chạy
 
 ### Yêu cầu
-- [Node.js](https://nodejs.org/) v18 trở lên
+- [Node.js](https://nodejs.org/) v18+
+- [Docker Desktop](https://www.docker.com/products/docker-desktop/) (để chạy Redis & RabbitMQ)
 
-### Bước 1 — Cài dependencies
+---
+
+### Bước 1 — Khởi động Redis & RabbitMQ bằng Docker
+
+```bash
+# Chạy từ thư mục Tuan9/
+docker-compose up -d
+```
+
+Kiểm tra đã chạy:
+```bash
+docker-compose ps
+```
+
+| Service | Port | Dùng để |
+|---------|------|---------|
+| Redis | `localhost:6379` | Cache layer |
+| RabbitMQ AMQP | `localhost:5672` | Message Queue |
+| RabbitMQ UI | `localhost:15672` | Quản lý queue trực quan |
+
+> **RabbitMQ Management UI**: mở http://localhost:15672  
+> Login: `admin` / `admin`
+
+---
+
+### Bước 2 — Cài dependencies Node.js
 
 ```bash
 cd backend
 npm install
 ```
 
-### Bước 2 — Chạy server
+---
+
+### Bước 3 — Tạo file .env
+
+```bash
+# Copy file mẫu
+copy .env.example .env
+```
+
+Nội dung mặc định (không cần sửa nếu dùng docker-compose):
+
+```env
+REDIS_HOST=127.0.0.1
+REDIS_PORT=6379
+REDIS_PASSWORD=
+
+RABBITMQ_URL=amqp://admin:admin@localhost:5672
+
+PORT=3000
+```
+
+---
+
+### Bước 4 — Chạy server
 
 ```bash
 node server.js
@@ -54,234 +105,172 @@ Kết quả mong đợi:
 
 ```
 [DB] Đã tạo 5 sản phẩm mẫu
-[Workers] write-services & read-services đang lắng nghe queue...
+[Redis] ✅ Connected to Redis server
+[RabbitMQ] ✅ Connected | Queues: write-mq, read-mq
+[write-services] 👂 Đang lắng nghe write-mq...
+[read-services]  👂 Đang lắng nghe read-mq...
 
-╔══════════════════════════════════════════════════╗
-║   ⚡ High-Throughput Architecture Demo API       ║
-║   🚀 Server running → http://localhost:3000      ║
-╚══════════════════════════════════════════════════╝
+╔══════════════════════════════════════════════════════╗
+║  ⚡ High-Throughput Architecture Demo API  v2        ║
+║  🚀 http://localhost:3000  |  Redis ✅  RabbitMQ ✅  ║
+╚══════════════════════════════════════════════════════╝
 ```
-
-> Server chạy tại **http://localhost:3000**  
-> File database `backend/data.sqlite` tự động tạo với 5 sản phẩm mẫu.
 
 ---
 
 ## 📬 Test bằng Postman
 
 ### Import Collection
-
-1. Mở **Postman**
-2. Nhấn **Import**
-3. Chọn file `ArchitectureDemo.postman_collection.json`
-4. Nhấn **Import**
-
-> Biến `{{base_url}}` đã được set sẵn là `http://localhost:3000`
+1. Mở **Postman** → **Import**
+2. Chọn file `ArchitectureDemo.postman_collection.json`
 
 ---
 
 ## 📋 Danh sách API Endpoints
 
-### `GET /`
-Health check, xem danh sách tất cả endpoints.
-
----
-
 ### `GET /api/products`
-Lấy tất cả sản phẩm — áp dụng **Cache-Aside Pattern**.
+Lấy tất cả sản phẩm — Cache-Aside với **Redis thật**.
 
-**Response mẫu (Cache HIT):**
 ```json
-{
-  "success": true,
-  "source": "cache",
-  "count": 5,
-  "data": [ ... ]
-}
-```
+// Lần 1 → Cache MISS → đọc DB qua RabbitMQ
+{ "success": true, "source": "database", "count": 5, "data": [...] }
 
-**Response mẫu (Cache MISS → DB):**
-```json
-{
-  "success": true,
-  "source": "database",
-  "count": 5,
-  "data": [ ... ]
-}
+// Lần 2 → Cache HIT → đọc thẳng Redis
+{ "success": true, "source": "cache", "count": 5, "data": [...] }
 ```
-
-> 💡 Gọi lần 1 → `source: "database"` | Gọi lần 2 → `source: "cache"`
 
 ---
 
 ### `GET /api/products/:id`
-Lấy sản phẩm theo ID.
-
-**Ví dụ:** `GET /api/products/p001`
-
-ID mẫu có sẵn: `p001` `p002` `p003` `p004` `p005`
+Lấy sản phẩm theo ID.  
+ID mẫu: `p001` `p002` `p003` `p004` `p005`
 
 ---
 
 ### `POST /api/products`
-Thêm sản phẩm mới — đẩy vào **write-mq**, xử lý bất đồng bộ.
+Thêm sản phẩm — publish vào **RabbitMQ write-mq**, trả **202** ngay.
 
-**Body (JSON):**
 ```json
+// Body
 {
   "name": "MacBook Pro M3",
   "price": 52990000,
   "category": "Electronics",
   "stock": 5
 }
-```
 
-**Response (202 Accepted):**
-```json
+// Response 202
 {
   "success": true,
-  "message": "Yêu cầu đã được đẩy vào write-mq, đang xử lý bất đồng bộ",
-  "messageId": "1714024800000-abc12",
-  "product": { "id": "a1b2c3d4", ... }
+  "message": "Yêu cầu đã vào write-mq → write-services đang xử lý",
+  "messageId": "a1b2c3d4"
 }
 ```
 
-> ⏳ Đợi ~100ms rồi gọi `GET /api/products` để thấy sản phẩm mới.
+> ⏳ Đợi ~100ms → `GET /api/products` thấy sản phẩm mới
 
 ---
 
 ### `PUT /api/products/:id`
-Cập nhật sản phẩm — đẩy vào **write-mq**.
+Cập nhật sản phẩm qua **write-mq**. Cache `all_products` và `product_<id>` tự xóa sau khi worker xử lý.
 
-**Body (JSON):**
 ```json
 {
-  "name": "Laptop Dell XPS 13 (Updated)",
-  "price": 26990000,
+  "name": "MacBook Pro M3 (Updated)",
+  "price": 49990000,
   "category": "Electronics",
-  "stock": 10
+  "stock": 3
 }
 ```
 
 ---
 
 ### `DELETE /api/products/:id`
-Xóa sản phẩm — đẩy vào **write-mq**.
-
-**Ví dụ:** `DELETE /api/products/p001`
+Xóa sản phẩm qua **write-mq**.
 
 ---
 
 ### `GET /api/stats`
-Xem thống kê toàn hệ thống.
+Thống kê thực tế từ Redis + RabbitMQ + DB.
 
-**Response mẫu:**
 ```json
 {
-  "success": true,
   "cache": {
     "keys": 2,
     "hits": 15,
     "misses": 3,
     "hitRate": "83.3%"
   },
-  "writeQueue": {
-    "name": "write-mq",
-    "pending": 0,
-    "processed": 12,
-    "failed": 0
-  },
-  "readQueue": {
-    "name": "read-mq",
-    "pending": 0,
-    "processed": 8,
-    "failed": 0
-  },
-  "database": {
-    "products": 17,
-    "eventLogs": 12
-  }
+  "writeQueue": { "name": "write-mq", "enqueued": 12, "processed": 12, "failed": 0 },
+  "readQueue":  { "name": "read-mq",  "enqueued": 8,  "processed": 8,  "failed": 0 },
+  "database":   { "products": 17, "eventLogs": 12 }
 }
 ```
 
 ---
 
 ### `POST /api/cache/flush`
-Xóa toàn bộ cache. Request tiếp theo sẽ phải đọc lại từ DB.
-
-**Không cần Body.**
+Xóa toàn bộ **Redis** cache (flushdb).
 
 ---
 
 ### `GET /api/logs?limit=20`
-Xem lịch sử các thao tác ghi (INSERT/UPDATE/DELETE) được write-services thực thi.
-
-**Query param:** `limit` — số lượng log muốn lấy (mặc định 20).
+Xem event log ghi bởi write-services.
 
 ---
 
 ### `POST /api/flood`
-Mô phỏng flood nhiều requests đồng thời (tối đa 200).
+Flood N requests vào RabbitMQ.
 
-**Body (JSON):**
 ```json
-{
-  "count": 50
-}
+{ "count": 100 }
 ```
-
-**Response mẫu:**
-```json
-{
-  "success": true,
-  "message": "Đã flood 50 requests",
-  "breakdown": { "writes": 19, "reads": 31 },
-  "queueStatus": {
-    "write": { "pending": 19, "processed": 0 },
-    "read":  { "pending": 31, "processed": 0 }
-  }
-}
-```
-
-> Gọi `GET /api/stats` sau vài giây để thấy queue đã xử lý xong.
 
 ---
 
 ## 🧪 Kịch bản test gợi ý
 
-### Kịch bản 1: Kiểm tra Cache-Aside
+### Kịch bản 1 — Cache-Aside với Redis thật
 ```
-1. POST /api/cache/flush          → Xóa cache sạch
-2. GET  /api/products             → source: "database" (Cache MISS)
-3. GET  /api/products             → source: "cache"    (Cache HIT) ✅
-4. GET  /api/stats                → Xem hitRate tăng lên
-```
-
-### Kịch bản 2: Async Write
-```
-1. POST /api/products  { name: "Test", price: 999000, category: "Test", stock: 1 }
-   → Nhận 202 ngay lập tức ✅
-2. Đợi 100ms
-3. GET  /api/products  → Thấy sản phẩm "Test" đã có trong DB ✅
-4. GET  /api/logs      → Thấy event INSERT được ghi lại ✅
+1. POST /api/cache/flush          → Xóa Redis
+2. GET  /api/products             → source: "database" (Cache MISS → RabbitMQ → DB)
+3. GET  /api/products             → source: "cache"    (Cache HIT ← Redis) ✅
+4. GET  /api/stats                → Xem hitRate Redis
 ```
 
-### Kịch bản 3: Cache Invalidation
+### Kịch bản 2 — Async Write qua RabbitMQ
 ```
-1. GET  /api/products/p001        → source: "database"
-2. GET  /api/products/p001        → source: "cache"
-3. PUT  /api/products/p001  { name: "Updated", price: 100, category: "X", stock: 1 }
-4. Đợi 100ms
-5. GET  /api/products/p001        → source: "database" (cache đã bị xóa) ✅
+1. POST /api/products  { name: "Test SP", price: 999000, ... }
+   → Nhận 202 ngay ✅ (message đang trong RabbitMQ write-mq)
+2. Mở http://localhost:15672 → Vào Queues → write-mq → thấy message
+3. Đợi ~100ms (worker tiêu thụ message)
+4. GET  /api/products  → thấy "Test SP" ✅
+5. GET  /api/logs      → thấy event INSERT ✅
 ```
 
-### Kịch bản 4: Flood Test
+### Kịch bản 3 — Cache Invalidation
+```
+1. GET  /api/products/p001  → source: "cache"
+2. PUT  /api/products/p001  { name: "Updated", price: 100, ... }
+3. Đợi ~100ms
+4. GET  /api/products/p001  → source: "database" (worker đã xóa Redis key) ✅
+```
+
+### Kịch bản 4 — Flood Test
 ```
 1. POST /api/flood { "count": 100 }
-2. GET  /api/stats  → Xem queue pending đang xử lý
-3. Đợi 5 giây
-4. GET  /api/stats  → Queue processed = 100, pending = 0 ✅
+2. Mở http://localhost:15672 → theo dõi queue xử lý real-time
+3. GET  /api/stats  → processed tăng lên ✅
 ```
+
+---
+
+## 🖥️ Theo dõi RabbitMQ Management UI
+
+Mở **http://localhost:15672** (admin/admin) để xem:
+- **Queues**: `write-mq`, `read-mq` — số message pending/processed
+- **Connections**: xem server đang kết nối
+- **Exchanges**: cấu hình routing
 
 ---
 
@@ -289,16 +278,20 @@ Mô phỏng flood nhiều requests đồng thời (tối đa 200).
 
 ```
 Tuan9/
-├── README.md                              ← File này
-├── index.html                             ← Visualizer animation (mở bằng trình duyệt)
-├── ArchitectureDemo.postman_collection.json ← Import vào Postman
+├── README.md
+├── docker-compose.yml                       ← Redis + RabbitMQ
+├── index.html                               ← Visualizer animation
+├── ArchitectureDemo.postman_collection.json
 └── backend/
-    ├── server.js    ← Express API (entry point)
-    ├── cache.js     ← Cache layer (mô phỏng Redis)
-    ├── queue.js     ← Message Queue (read-mq & write-mq)
-    ├── workers.js   ← write-services & read-services
-    ├── db.js        ← SQLite setup & seed data
-    ├── data.sqlite  ← Database file (tự sinh)
+    ├── server.js     ← Express API entry point
+    ├── config.js     ← Cấu hình từ .env
+    ├── cache.js      ← Redis (ioredis)
+    ├── queue.js      ← RabbitMQ producer + RPC reply
+    ├── workers.js    ← RabbitMQ consumers (write & read)
+    ├── db.js         ← SQLite + seed data
+    ├── .env          ← Biến môi trường (tự tạo từ .env.example)
+    ├── .env.example
+    ├── data.sqlite   ← DB file (tự sinh)
     └── package.json
 ```
 
@@ -306,9 +299,25 @@ Tuan9/
 
 ## 🛠️ Công nghệ sử dụng
 
-| Thành phần | Trong demo | Thực tế |
+| Thành phần | Công nghệ | Ghi chú |
 |---|---|---|
-| Cache | `node-cache` (in-memory) | Redis |
-| Message Queue | `EventEmitter` (in-memory) | RabbitMQ / Kafka / Bull |
-| Database | SQLite (`better-sqlite3`) | PostgreSQL / MySQL |
-| API Server | Express.js | Express / NestJS / FastAPI |
+| Cache | **Redis** (ioredis) | Thực tế, TTL 30s |
+| Message Queue | **RabbitMQ** (amqplib) | Thực tế, durable queue |
+| Read Pattern | **RPC qua RabbitMQ** | correlationId + replyTo |
+| Database | SQLite (better-sqlite3) | Demo; thay bằng PostgreSQL/MySQL thực tế |
+| API Server | Express.js | |
+| Infrastructure | Docker Compose | Redis 7, RabbitMQ 3 |
+
+---
+
+## 🛑 Dừng hệ thống
+
+```bash
+# Dừng server: Ctrl+C
+
+# Dừng Docker
+docker-compose down
+
+# Dừng Docker và xóa data
+docker-compose down -v
+```

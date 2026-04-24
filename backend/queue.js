@@ -1,47 +1,117 @@
 // =========================================================
-//  queue.js – Message Queue mô phỏng (in-memory EventEmitter)
-//  Giả lập read-mq và write-mq trong sơ đồ kiến trúc
+//  queue.js – Real RabbitMQ via amqplib
+//
+//  WRITE: fire-and-forget  →  publish to write-mq
+//  READ:  RPC pattern      →  publish to read-mq với replyTo
+//         kết quả trả về qua exclusive reply queue
 // =========================================================
-const { EventEmitter } = require('events');
+const amqp   = require('amqplib');
+const { v4: uuidv4 } = require('uuid');
+const config = require('./config');
 
-class MessageQueue extends EventEmitter {
-  constructor(name) {
-    super();
-    this.name = name;
-    this.queue = [];
-    this.processed = 0;
-    this.failed = 0;
-    this.processing = false;
-  }
+const WRITE_QUEUE = 'write-mq';
+const READ_QUEUE  = 'read-mq';
 
-  // Producer: đẩy message vào queue
-  enqueue(payload) {
-    const msg = {
-      id: Date.now() + '-' + Math.random().toString(36).slice(2, 7),
-      payload,
-      enqueuedAt: new Date().toISOString(),
-      attempts: 0,
-    };
-    this.queue.push(msg);
-    console.log(`[${this.name}] ⬆ Enqueued #${msg.id} | Queue size: ${this.queue.length}`);
-    this.emit('message', msg);
-    return msg.id;
-  }
+let connection, channel, replyQueue;
 
-  // Lấy kích thước queue
-  size() { return this.queue.length; }
+// Map lưu callback đang chờ (correlationId → resolve)
+const pendingReads = new Map();
 
-  stats() {
-    return {
-      name: this.name,
-      pending: this.queue.length,
-      processed: this.processed,
-      failed: this.failed,
-    };
-  }
+// Counters
+const counters = {
+  write: { enqueued: 0, processed: 0, failed: 0 },
+  read:  { enqueued: 0, processed: 0, failed: 0 },
+};
+
+// ── Connect ───────────────────────────────────────────────
+async function connect() {
+  connection = await amqp.connect(config.rabbitmq.url);
+  channel    = await connection.createChannel();
+
+  // Khai báo queue bền vững (write) và tạm (read)
+  await channel.assertQueue(WRITE_QUEUE, { durable: true });
+  await channel.assertQueue(READ_QUEUE,  { durable: false });
+
+  // Tạo exclusive reply queue cho RPC pattern
+  const { queue } = await channel.assertQueue('', { exclusive: true });
+  replyQueue = queue;
+
+  // Lắng nghe kết quả từ read-services trả về
+  channel.consume(replyQueue, (msg) => {
+    if (!msg) return;
+    const correlationId = msg.properties.correlationId;
+    const pending       = pendingReads.get(correlationId);
+    if (pending) {
+      pendingReads.delete(correlationId);
+      pending.resolve(JSON.parse(msg.content.toString()));
+      counters.read.processed++;
+    }
+  }, { noAck: true });
+
+  console.log('[RabbitMQ] ✅ Connected | Queues: write-mq, read-mq | ReplyTo:', replyQueue);
+
+  // Xử lý ngắt kết nối
+  connection.on('close', () => console.warn('[RabbitMQ] ⚠️  Connection closed'));
+  connection.on('error', (e) => console.error('[RabbitMQ] ❌', e.message));
 }
 
-const writeQueue = new MessageQueue('write-mq');
-const readQueue  = new MessageQueue('read-mq');
+// ── Producer: Write (fire-and-forget) ────────────────────
+function publishWrite(action, data) {
+  const msgId   = uuidv4().slice(0, 8);
+  const payload  = JSON.stringify({ action, data });
 
-module.exports = { writeQueue, readQueue };
+  channel.sendToQueue(
+    WRITE_QUEUE,
+    Buffer.from(payload),
+    { persistent: true, messageId: msgId }
+  );
+
+  counters.write.enqueued++;
+  console.log(`[write-mq] ⬆ Enqueued ${action} | msgId=${msgId}`);
+  return msgId;
+}
+
+// ── Producer: Read (RPC – chờ kết quả trả về) ────────────
+function publishRead(key, query) {
+  return new Promise((resolve, reject) => {
+    const correlationId = uuidv4();
+    pendingReads.set(correlationId, { resolve, key });
+
+    // Timeout 5s nếu worker không trả về
+    const timer = setTimeout(() => {
+      if (pendingReads.has(correlationId)) {
+        pendingReads.delete(correlationId);
+        reject(new Error(`Read timeout for key="${key}"`));
+      }
+    }, 5000);
+
+    // Bọc resolve để clear timer
+    const originalResolve = resolve;
+    pendingReads.set(correlationId, {
+      resolve: (data) => { clearTimeout(timer); originalResolve(data); },
+      key,
+    });
+
+    channel.sendToQueue(
+      READ_QUEUE,
+      Buffer.from(JSON.stringify({ key, query })),
+      { correlationId, replyTo: replyQueue }
+    );
+
+    counters.read.enqueued++;
+    console.log(`[read-mq] ⬆ Enqueued read | key="${key}" | corr=${correlationId.slice(0, 8)}`);
+  });
+}
+
+function incrementFail(type) { counters[type].failed++; }
+
+function getStats() {
+  return {
+    writeQueue: { name: WRITE_QUEUE, pending: pendingReads.size, ...counters.write },
+    readQueue:  { name: READ_QUEUE,  pending: pendingReads.size, ...counters.read  },
+  };
+}
+
+function getChannel() { return channel; }
+
+module.exports = { connect, publishWrite, publishRead, getStats, getChannel, incrementFail, WRITE_QUEUE, READ_QUEUE };
