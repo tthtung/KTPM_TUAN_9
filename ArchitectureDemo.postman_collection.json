@@ -1,0 +1,123 @@
+{
+  "info": {
+    "name": "High-Throughput Architecture Demo",
+    "description": "Demo API: Cache-Aside + Message Queue Pattern\n\nKiến trúc:\n- BE nhận request\n- READ: Kiểm tra Cache → Cache MISS thì đẩy vào read-mq → read-services đọc DB\n- WRITE: Đẩy vào write-mq → write-services ghi DB bất đồng bộ",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "base_url", "value": "http://localhost:3000", "type": "string" },
+    { "key": "product_id", "value": "p001", "type": "string" }
+  ],
+  "item": [
+    {
+      "name": "🏠 Health Check",
+      "request": {
+        "method": "GET",
+        "url": { "raw": "{{base_url}}/", "host": ["{{base_url}}"], "path": [""] },
+        "description": "Kiểm tra server đang chạy và xem danh sách endpoints"
+      }
+    },
+    {
+      "name": "📦 PRODUCTS",
+      "item": [
+        {
+          "name": "GET All Products (Cache-Aside)",
+          "request": {
+            "method": "GET",
+            "url": { "raw": "{{base_url}}/api/products", "host": ["{{base_url}}"], "path": ["api","products"] },
+            "description": "Lần đầu: source=database (Cache MISS → read-mq → DB)\nLần 2+:  source=cache  (Cache HIT → trả ngay)"
+          }
+        },
+        {
+          "name": "GET Product by ID",
+          "request": {
+            "method": "GET",
+            "url": { "raw": "{{base_url}}/api/products/{{product_id}}", "host": ["{{base_url}}"], "path": ["api","products","{{product_id}}"] },
+            "description": "Đổi product_id trong Variables. Thử p001 → p005"
+          }
+        },
+        {
+          "name": "POST Create Product (→ write-mq)",
+          "request": {
+            "method": "POST",
+            "url": { "raw": "{{base_url}}/api/products", "host": ["{{base_url}}"], "path": ["api","products"] },
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"MacBook Pro M3 14 inch\",\n  \"price\": 52990000,\n  \"category\": \"Electronics\",\n  \"stock\": 5\n}"
+            },
+            "description": "HTTP 202 Accepted → request đã vào write-mq, worker xử lý bất đồng bộ.\nSau ~100ms gọi GET /api/products để thấy sản phẩm mới."
+          }
+        },
+        {
+          "name": "PUT Update Product (→ write-mq)",
+          "request": {
+            "method": "PUT",
+            "url": { "raw": "{{base_url}}/api/products/{{product_id}}", "host": ["{{base_url}}"], "path": ["api","products","{{product_id}}"] },
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Laptop Dell XPS 13 (Updated)\",\n  \"price\": 26990000,\n  \"category\": \"Electronics\",\n  \"stock\": 10\n}"
+            },
+            "description": "Gửi UPDATE vào write-mq. Cache tự động bị xóa sau khi worker xử lý."
+          }
+        },
+        {
+          "name": "DELETE Product (→ write-mq)",
+          "request": {
+            "method": "DELETE",
+            "url": { "raw": "{{base_url}}/api/products/{{product_id}}", "host": ["{{base_url}}"], "path": ["api","products","{{product_id}}"] },
+            "description": "Gửi DELETE vào write-mq. Sản phẩm sẽ bị xóa sau ~50ms."
+          }
+        }
+      ]
+    },
+    {
+      "name": "📊 SYSTEM",
+      "item": [
+        {
+          "name": "GET System Stats",
+          "request": {
+            "method": "GET",
+            "url": { "raw": "{{base_url}}/api/stats", "host": ["{{base_url}}"], "path": ["api","stats"] },
+            "description": "Xem thống kê:\n- Cache: hits, misses, hitRate\n- Queue: pending, processed, failed\n- Database: tổng số records"
+          }
+        },
+        {
+          "name": "GET Event Logs",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{base_url}}/api/logs?limit=20",
+              "host": ["{{base_url}}"],
+              "path": ["api","logs"],
+              "query": [{ "key": "limit", "value": "20" }]
+            },
+            "description": "Xem lịch sử các thao tác INSERT/UPDATE/DELETE đã được ghi bởi write-services"
+          }
+        },
+        {
+          "name": "POST Flush Cache",
+          "request": {
+            "method": "POST",
+            "url": { "raw": "{{base_url}}/api/cache/flush", "host": ["{{base_url}}"], "path": ["api","cache","flush"] },
+            "description": "Xóa toàn bộ cache. Sau đó gọi GET /api/products → sẽ thấy source=database"
+          }
+        },
+        {
+          "name": "POST Flood Test (50 requests)",
+          "request": {
+            "method": "POST",
+            "url": { "raw": "{{base_url}}/api/flood", "host": ["{{base_url}}"], "path": ["api","flood"] },
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"count\": 50\n}"
+            },
+            "description": "Mô phỏng 50 requests đồng thời (40% write, 60% read).\nSau đó gọi GET /api/stats để thấy queue đã xử lý bao nhiêu."
+          }
+        }
+      ]
+    }
+  ]
+}
